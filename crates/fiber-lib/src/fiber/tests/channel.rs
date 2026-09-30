@@ -9853,8 +9853,6 @@ async fn test_reestablish_replays_reverse_commitment_for_different_next_nonce() 
     );
 }
 
-#[ignore]
-// Known regression: revocation-nonce stall after lost CommitmentSigned + two rapid reconnects. Revisit the nonce re-sync mechanism.
 #[tokio::test]
 async fn test_payments_finish_after_lost_commitment_and_two_rapid_reconnects() {
     init_tracing();
@@ -10102,6 +10100,170 @@ async fn test_payments_finish_after_lost_commitment_and_two_rapid_reconnects() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A revocation round can be left one RevokeAndAck short across a reconnect, when the side
+/// that answered the last CommitmentSigned never sent the CommitmentSigned that completes the
+/// round: a node without the reply-time completion, or one that crashed right after its
+/// RevokeAndAck. The next reestablishment must complete the round, instead of leaving both
+/// sides shown as ChannelReady but blocked by `is_waiting_tlc_ack` (#1561).
+#[tokio::test]
+async fn test_reestablish_completes_revocation_round_left_short() {
+    init_tracing();
+    let (mut node_a, mut node_b, channel_id) =
+        create_nodes_with_established_channel(50_000_000_000, 10_000_000_000, true).await;
+    let skip_completion_on_reply = |node: &NetworkNode, skip: bool| {
+        node.network_actor
+            .send_message(NetworkActorMessage::Command(
+                NetworkActorCommand::ControlFiberChannel(ChannelCommandWithId {
+                    channel_id,
+                    command: ChannelCommand::SkipRevocationRoundCompletionOnReply(skip),
+                }),
+            ))
+            .expect("channel actor alive");
+    };
+    skip_completion_on_reply(&node_a, true);
+
+    // The schedule of test_payments_finish_after_lost_commitment_and_two_rapid_reconnects:
+    // it ends with A answering B's last CommitmentSigned with nothing of its own to sign.
+    node_a
+        .hold_next_fiber_messages(
+            node_b.pubkey,
+            channel_id,
+            TestFiberMessageKind::CommitmentSigned,
+            1,
+        )
+        .await;
+    let mut payment_hashes = Vec::with_capacity(5);
+    for index in 0..5 {
+        let payment = node_a
+            .send_payment_keysend(&node_b, 100_000_000, false)
+            .await
+            .unwrap_or_else(|err| panic!("start keysend payment {index}: {err}"));
+        payment_hashes.push(payment.payment_hash);
+    }
+    node_a.wait_for_held_fiber_messages(1).await;
+    disconnect_peers_and_wait_for_channel_offline(
+        &mut node_a,
+        &mut node_b,
+        channel_id,
+        "lost CommitmentSigned disconnect",
+    )
+    .await;
+    let lost_messages = take_held_fiber_messages_bounded(&node_a, "lost CommitmentSigned").await;
+    assert_eq!(lost_messages.len(), 1);
+    node_a.connect_to(&mut node_b).await;
+    tokio::time::timeout(event_wait_timeout(), async {
+        loop {
+            let state_a = node_a.get_channel_actor_state(channel_id);
+            let state_b = node_b.get_channel_actor_state(channel_id);
+            if !state_a.reestablishing && !state_b.reestablishing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first reestablishment must complete");
+    disconnect_peers_and_wait_for_channel_offline(
+        &mut node_a,
+        &mut node_b,
+        channel_id,
+        "second rapid disconnect",
+    )
+    .await;
+    node_a.connect_to(&mut node_b).await;
+
+    // Without the reply-time completion, the round stays one RevokeAndAck short at rest.
+    let short_round = |state_a: &ChannelActorState, state_b: &ChannelActorState| {
+        !state_a.reestablishing
+            && !state_b.reestablishing
+            && !state_a.tlc_state.waiting_ack
+            && !state_b.tlc_state.waiting_ack
+            && state_a.remote_revocation_nonce_for_send.is_none()
+            && state_a.remote_revocation_nonce_for_verify.is_some()
+            && state_b.remote_revocation_nonce_for_send.is_some()
+            && state_b.remote_revocation_nonce_for_verify.is_none()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state_a = node_a.get_channel_actor_state(channel_id);
+        let state_b = node_b.get_channel_actor_state(channel_id);
+        if short_round(&state_a, &state_b) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (state_a, state_b) = (
+                node_a.get_channel_actor_state(channel_id),
+                node_b.get_channel_actor_state(channel_id),
+            );
+            if short_round(&state_a, &state_b) {
+                assert_eq!(
+                    state_a.get_remote_commitment_number(),
+                    state_a.get_local_commitment_number() + 1
+                );
+                assert_eq!(
+                    state_b.get_local_commitment_number(),
+                    state_b.get_remote_commitment_number() + 1
+                );
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the round was not left short: A send/verify present = {}/{}, B send/verify present = {}/{}",
+            state_a.remote_revocation_nonce_for_send.is_some(),
+            state_a.remote_revocation_nonce_for_verify.is_some(),
+            state_b.remote_revocation_nonce_for_send.is_some(),
+            state_b.remote_revocation_nonce_for_verify.is_some(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A gets the completion back (as after an upgrade) and reconnects: reestablishment
+    // completes the round, and the commitment numbers are back in step on both sides.
+    skip_completion_on_reply(&node_a, false);
+    disconnect_peers_and_wait_for_channel_offline(
+        &mut node_a,
+        &mut node_b,
+        channel_id,
+        "reconnect with the round left short",
+    )
+    .await;
+    node_a.connect_to(&mut node_b).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state_a = node_a.get_channel_actor_state(channel_id);
+        let state_b = node_b.get_channel_actor_state(channel_id);
+        let settled = |state: &ChannelActorState| {
+            !state.reestablishing
+                && !state.tlc_state.waiting_ack
+                && state.remote_revocation_nonce_for_send.is_some()
+                && state.remote_revocation_nonce_for_verify.is_some()
+        };
+        if settled(&state_a) && settled(&state_b) {
+            for state in [&state_a, &state_b] {
+                assert_eq!(state.state, ChannelState::ChannelReady);
+                assert_eq!(
+                    state.get_local_commitment_number(),
+                    state.get_remote_commitment_number(),
+                    "a balanced ledger has equal local and remote commitment numbers"
+                );
+            }
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the round was not completed after reestablish: A send/verify present = {}/{}, B send/verify present = {}/{}",
+            state_a.remote_revocation_nonce_for_send.is_some(),
+            state_a.remote_revocation_nonce_for_verify.is_some(),
+            state_b.remote_revocation_nonce_for_send.is_some(),
+            state_b.remote_revocation_nonce_for_verify.is_some(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for payment_hash in payment_hashes {
+        node_a.wait_until_success(payment_hash).await;
     }
 }
 

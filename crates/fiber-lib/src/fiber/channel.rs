@@ -215,6 +215,8 @@ pub enum ChannelCommand {
     #[cfg(any(test, feature = "bench"))]
     SetDeferPeerTlcUpdates(bool),
     #[cfg(any(test, feature = "bench"))]
+    SkipRevocationRoundCompletionOnReply(bool),
+    #[cfg(any(test, feature = "bench"))]
     TestBarrier(RpcReplyPort<()>),
     #[cfg(any(test, feature = "bench"))]
     ReloadState(ReloadParams),
@@ -237,6 +239,10 @@ impl Display for ChannelCommand {
             #[cfg(any(test, feature = "bench"))]
             ChannelCommand::SetDeferPeerTlcUpdates(enabled) => {
                 write!(f, "SetDeferPeerTlcUpdates [{enabled}]")
+            }
+            #[cfg(any(test, feature = "bench"))]
+            ChannelCommand::SkipRevocationRoundCompletionOnReply(skip) => {
+                write!(f, "SkipRevocationRoundCompletionOnReply [{skip}]")
             }
             #[cfg(any(test, feature = "bench"))]
             ChannelCommand::TestBarrier(_) => write!(f, "TestBarrier"),
@@ -403,6 +409,10 @@ pub struct ChannelEphemeralConfig {
     pub external_funding_timeout_seconds: u64,
     // Runtime state for external funding flow; this is intentionally not persisted.
     pub external_funding: ExternalFundingRuntime,
+    // Tests only: act like a node without the reply-time completion of a revocation round
+    // left one RevokeAndAck short, so that the completion on reestablish can be exercised.
+    #[cfg(any(test, feature = "bench"))]
+    pub skip_revocation_round_completion_on_reply: bool,
 }
 
 impl Default for ChannelEphemeralConfig {
@@ -411,6 +421,8 @@ impl Default for ChannelEphemeralConfig {
             funding_timeout_seconds: DEFAULT_FUNDING_TIMEOUT_SECONDS,
             external_funding_timeout_seconds: DEFAULT_EXTERNAL_FUNDING_TIMEOUT_SECONDS,
             external_funding: Default::default(),
+            #[cfg(any(test, feature = "bench"))]
+            skip_revocation_round_completion_on_reply: false,
         }
     }
 }
@@ -1159,6 +1171,14 @@ where
                         if flags.contains(SigningCommitmentFlags::THEIR_COMMITMENT_SIGNED_SENT)
                             && !flags.contains(SigningCommitmentFlags::OUR_COMMITMENT_SIGNED_SENT)
                 );
+        // The RevokeAndAck we just sent may leave the revocation round one RevokeAndAck short
+        // with nothing of ours to sign; complete it anyway (see owes_rebalancing_commitment_signed).
+        let owes_rebalancing = state.owes_rebalancing_commitment_signed();
+        #[cfg(any(test, feature = "bench"))]
+        let owes_rebalancing = owes_rebalancing
+            && !state
+                .ephemeral_config
+                .skip_revocation_round_completion_on_reply;
         if should_reply_external_funding_handshake && !state.tlc_state.waiting_ack {
             let previous_remote_nonce = previous_remote_nonce.ok_or_else(|| {
                 ProcessingChannelError::InvalidState(
@@ -1171,7 +1191,12 @@ where
             state.commit_remote_nonce(previous_remote_nonce);
             self.handle_commitment_signed_command(myself, state).await?;
             state.commit_remote_nonce(next_commitment_nonce);
-        } else if need_commitment_signed && !state.tlc_state.waiting_ack {
+        } else if (need_commitment_signed || owes_rebalancing) && !state.tlc_state.waiting_ack {
+            if !need_commitment_signed {
+                state.log_ack_state(
+                    "[ack] rebalance: CommitmentSigned to complete the revocation round",
+                );
+            }
             self.handle_commitment_signed_command(myself, state).await?;
         }
 
@@ -1997,6 +2022,21 @@ where
             debug!(
                 "[SEND_CS] waiting_ack=true for channel {}, skip duplicate CommitmentSigned",
                 state.get_id()
+            );
+            return Ok(());
+        }
+        // Never sign a new CommitmentSigned while our verify nonce is missing. We have then
+        // received one more RevokeAndAck than we have sent, so the peer's send nonce is
+        // consumed too, and it could only answer with its cached RevokeAndAck. The peer owes
+        // us a CommitmentSigned for this round (see `owes_rebalancing_commitment_signed`); our
+        // RevokeAndAck to it restores the verify nonce, and any pending update is signed then.
+        if matches!(
+            state.state,
+            ChannelState::ChannelReady | ChannelState::ShuttingDown(_)
+        ) && state.remote_revocation_nonce_for_verify.is_none()
+        {
+            state.log_ack_state(
+                "[ack] defer CommitmentSigned until our RevokeAndAck rebalances the ledger",
             );
             return Ok(());
         }
@@ -2874,6 +2914,13 @@ where
                 } else {
                     state.stop_defer_peer_tlc_updates();
                 }
+                Ok(())
+            }
+            #[cfg(any(test, feature = "bench"))]
+            ChannelCommand::SkipRevocationRoundCompletionOnReply(skip) => {
+                state
+                    .ephemeral_config
+                    .skip_revocation_round_completion_on_reply = skip;
                 Ok(())
             }
             #[cfg(any(test, feature = "bench"))]
@@ -7667,6 +7714,20 @@ impl ChannelActorState {
         Ok(())
     }
 
+    /// We have sent one more RevokeAndAck than we have received: our send nonce is
+    /// consumed and our verify nonce is not. (Sending a new RevokeAndAck advances our
+    /// remote_commitment_number and receiving one advances our local_commitment_number, so
+    /// in this state remote is local + 1.) The peer is then missing its verify nonce and
+    /// can only rebalance by answering a CommitmentSigned from us with a RevokeAndAck;
+    /// `is_waiting_tlc_ack` blocks both sides' TLC updates meanwhile. So unless a
+    /// CommitmentSigned of ours is already in flight, we owe one, even with no TLC update
+    /// to sign (#1561). Only one side can be in this state at a time.
+    pub(crate) fn owes_rebalancing_commitment_signed(&self) -> bool {
+        !self.tlc_state.waiting_ack
+            && self.remote_revocation_nonce_for_send.is_none()
+            && self.remote_revocation_nonce_for_verify.is_some()
+    }
+
     pub fn is_waiting_tlc_ack(&self) -> bool {
         self.tlc_state.waiting_ack
             || self.remote_revocation_nonce_for_send.is_none()
@@ -9358,9 +9419,17 @@ impl ChannelActorState {
             }
         }
 
+        // Also repairs a revocation round left one RevokeAndAck short before the reconnect,
+        // e.g. by a crash between our RevokeAndAck and the CommitmentSigned that follows it.
+        let owes_rebalancing = self.owes_rebalancing_commitment_signed();
         if send_commitment_signed
-            && (need_commitment_signed || self.tlc_state.need_another_commitment_signed())
+            && (need_commitment_signed
+                || self.tlc_state.need_another_commitment_signed()
+                || owes_rebalancing)
         {
+            if owes_rebalancing {
+                self.log_ack_state("[ack] rebalance on reestablish: CommitmentSigned to complete the revocation round");
+            }
             network
                 .send_message(NetworkActorMessage::new_command(
                     NetworkActorCommand::ControlFiberChannel(ChannelCommandWithId {
