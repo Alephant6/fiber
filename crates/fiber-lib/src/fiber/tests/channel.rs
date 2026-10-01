@@ -13436,6 +13436,123 @@ async fn test_channel_force_closes_after_revocation_round_completion() {
     .await;
 }
 
+/// A revocation round left one RevokeAndAck short while the channel is shutting down is completed
+/// as in ChannelReady. A cooperative close waits for pending TLCs, and `is_waiting_tlc_ack` would
+/// block the RemoveTlc of a round left short, so without the completion the channel would stay in
+/// ShuttingDown with the TLC (#1561).
+#[tokio::test]
+async fn test_revocation_round_completes_while_shutting_down() {
+    init_tracing();
+    let (mut node_a, node_b, channel_id) =
+        create_nodes_with_established_channel(50_000_000_000, 50_000_000_000, true).await;
+    let old_balance_a = node_a.get_channel_actor_state(channel_id).to_local_amount;
+    let old_balance_b = node_b.get_channel_actor_state(channel_id).to_local_amount;
+
+    // A offers B a TLC that B holds, so the shutdown has to wait for it.
+    let preimage = [7; 32];
+    let algorithm = HashAlgorithm::CkbHash;
+    let digest = algorithm.hash(preimage);
+    let tlc_amount = 1_000_000_000;
+    let expiry = now_timestamp_as_millis_u64() + DEFAULT_TLC_EXPIRY_DELTA;
+    let add_tlc_result = call!(node_a.network_actor, |rpc_reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+            ChannelCommandWithId {
+                channel_id,
+                command: ChannelCommand::AddTlc(
+                    create_mock_pending_add_tlc_command(
+                        &node_a,
+                        &node_b,
+                        tlc_amount,
+                        algorithm,
+                        digest.into(),
+                        expiry,
+                    ),
+                    rpc_reply,
+                ),
+            },
+        ))
+    })
+    .expect("node_a alive")
+    .expect("A adds a TLC");
+    wait_until_revocation_rounds_settle(&node_a, channel_id).await;
+    wait_until_revocation_rounds_settle(&node_b, channel_id).await;
+
+    node_a
+        .send_shutdown(channel_id, false)
+        .await
+        .expect("cooperatively shutdown channel");
+    for node in [&node_a, &node_b] {
+        wait_until_timeout(10_000, || {
+            matches!(
+                node.get_channel_actor_state(channel_id).state,
+                ChannelState::ShuttingDown(flags)
+                    if flags.contains(ShuttingDownFlags::AWAITING_PENDING_TLCS)
+            )
+        })
+        .await;
+    }
+
+    // B signs a commitment without any TLC update. A answers it with a RevokeAndAck and has
+    // nothing to sign back, so A has to complete the round.
+    let local_before = node_b
+        .get_channel_actor_state(channel_id)
+        .get_local_commitment_number();
+    send_commitment_signed_command(&node_b, channel_id);
+    node_a
+        .expect_debug_event("RevocationRoundCompletedOnReply")
+        .await;
+    wait_until_revocation_rounds_settle(&node_a, channel_id).await;
+    wait_until_revocation_rounds_settle(&node_b, channel_id).await;
+    assert!(
+        node_b
+            .get_channel_actor_state(channel_id)
+            .get_local_commitment_number()
+            > local_before
+    );
+    for node in [&node_a, &node_b] {
+        let state = node.get_channel_actor_state(channel_id);
+        assert!(matches!(state.state, ChannelState::ShuttingDown(_)));
+        assert!(state.any_tlc_pending());
+    }
+
+    // B fulfills the TLC; once it is removed on both sides, the channel closes cooperatively.
+    call!(node_b.network_actor, |rpc_reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+            ChannelCommandWithId {
+                channel_id,
+                command: ChannelCommand::RemoveTlc(
+                    RemoveTlcCommand {
+                        id: add_tlc_result.tlc_id,
+                        reason: RemoveTlcReason::RemoveTlcFulfill(RemoveTlcFulfill {
+                            payment_preimage: preimage.into(),
+                        }),
+                    },
+                    rpc_reply,
+                ),
+            },
+        ))
+    })
+    .expect("node_b alive")
+    .expect("B removes the TLC");
+    for node in [&node_a, &node_b] {
+        wait_until_timeout(30_000, || {
+            matches!(
+                node.get_channel_actor_state(channel_id).state,
+                ChannelState::Closed(CloseFlags::COOPERATIVE)
+            )
+        })
+        .await;
+    }
+    let state_a = node_a.get_channel_actor_state(channel_id);
+    let state_b = node_b.get_channel_actor_state(channel_id);
+    assert_eq!(
+        state_a.shutdown_transaction_hash,
+        state_b.shutdown_transaction_hash
+    );
+    assert_eq!(state_a.to_local_amount, old_balance_a - tlc_amount);
+    assert_eq!(state_b.to_local_amount, old_balance_b + tlc_amount);
+}
+
 /// The completing CommitmentSigned of #1561 signs the commitment transaction of a UDT channel
 /// as well, which carries the UDT type script and amount in its output.
 #[tokio::test]
