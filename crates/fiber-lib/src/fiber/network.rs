@@ -7969,6 +7969,8 @@ where
                 funding_timeout_seconds: config.funding_timeout_seconds,
                 external_funding_timeout_seconds: config.external_funding_timeout_seconds,
                 external_funding: Default::default(),
+                #[cfg(any(test, feature = "bench"))]
+                skip_revocation_round_completion_on_reply: false,
             },
             inflight_payments: Default::default(),
             pending_external_funding_replies: Default::default(),
