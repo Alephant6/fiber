@@ -13553,6 +13553,110 @@ async fn test_revocation_round_completes_while_shutting_down() {
     assert_eq!(state_b.to_local_amount, old_balance_b + tlc_amount);
 }
 
+/// Takes the single CommitmentSigned held at `node`.
+async fn take_held_commitment_signed(node: &NetworkNode, context: &str) -> CommitmentSigned {
+    let held = take_held_fiber_messages_bounded(node, context).await;
+    assert_eq!(held.len(), 1, "{context}: expected one held message");
+    match held.into_iter().next().expect("one held message").message {
+        FiberMessage::ChannelNormalOperation(FiberChannelMessage::CommitmentSigned(
+            commitment_signed,
+        )) => commitment_signed,
+        other => panic!("{context}: expected a CommitmentSigned, got {other:?}"),
+    }
+}
+
+/// The CommitmentSigned that completes a revocation round left short (#1561) is stored as a
+/// CommitDiff before it is sent, so a node that crashes after sending it replays the stored
+/// signature on reconnect instead of signing the commitment again. MuSig2 nonces are derived from
+/// the commitment number, so a second signature over different content would reuse a nonce.
+#[tokio::test]
+async fn test_revocation_round_completion_is_replayed_after_restart() {
+    init_tracing();
+    let (mut node_a, mut node_b, channel_id) =
+        create_nodes_with_established_channel(50_000_000_000, 50_000_000_000, true).await;
+    let fatal_events = vec![
+        "panicked".to_string(),
+        "is reused for different messages".to_string(),
+    ];
+    node_a.add_unexpected_events(fatal_events.clone()).await;
+    node_b.add_unexpected_events(fatal_events.clone()).await;
+
+    // B signs a commitment without any TLC update. A answers it and sends the CommitmentSigned
+    // that completes the round, which is lost when A crashes.
+    node_a
+        .hold_next_fiber_messages(
+            node_b.pubkey,
+            channel_id,
+            TestFiberMessageKind::CommitmentSigned,
+            1,
+        )
+        .await;
+    send_commitment_signed_command(&node_b, channel_id);
+    node_a
+        .expect_debug_event("RevocationRoundCompletedOnReply")
+        .await;
+    node_a.wait_for_held_fiber_messages(1).await;
+    let sent = take_held_commitment_signed(&node_a, "completing CommitmentSigned").await;
+    assert!(
+        node_a.store.get_pending_commit_diff(&channel_id).is_some(),
+        "the completing CommitmentSigned is stored before it is sent"
+    );
+
+    // A crashes and restarts from its store while B is offline, so that its replay on the next
+    // reconnect can be held and compared. Signing the commitment again would go through the
+    // completion on reestablish, so that must not happen.
+    node_b.stop().await;
+    node_a.restart().await;
+    let mut no_second_signature = fatal_events.clone();
+    no_second_signature.push("RevocationRoundCompletedOnReestablish".to_string());
+    node_a.add_unexpected_events(no_second_signature).await;
+    node_a
+        .hold_next_fiber_messages(
+            node_b.pubkey,
+            channel_id,
+            TestFiberMessageKind::CommitmentSigned,
+            1,
+        )
+        .await;
+    node_b.start().await;
+    node_b.add_unexpected_events(fatal_events).await;
+    node_a.connect_to(&mut node_b).await;
+    node_a.wait_for_held_fiber_messages(1).await;
+    let replayed = take_held_commitment_signed(&node_a, "replayed CommitmentSigned").await;
+    assert_eq!(replayed.channel_id, sent.channel_id);
+    assert_eq!(
+        replayed.funding_tx_partial_signature, sent.funding_tx_partial_signature,
+        "the replay must carry the stored signature"
+    );
+    assert_eq!(replayed.next_commitment_nonce, sent.next_commitment_nonce);
+
+    // Let the replay through this time: the round completes and both directions can pay.
+    disconnect_peers_and_wait_for_channel_offline(
+        &mut node_a,
+        &mut node_b,
+        channel_id,
+        "deliver the replayed CommitmentSigned",
+    )
+    .await;
+    node_a.connect_to(&mut node_b).await;
+    wait_until_revocation_rounds_settle(&node_a, channel_id).await;
+    wait_until_revocation_rounds_settle(&node_b, channel_id).await;
+    let payment = node_a
+        .send_payment_keysend(&node_b, 100_000_000, false)
+        .await
+        .expect("A pays B");
+    node_a.wait_until_success(payment.payment_hash).await;
+    let payment = node_b
+        .send_payment_keysend(&node_a, 100_000_000, false)
+        .await
+        .expect("B pays A");
+    node_b.wait_until_success(payment.payment_hash).await;
+    for node in [&node_a, &node_b] {
+        let triggered = node.get_triggered_unexpected_events().await;
+        assert!(triggered.is_empty(), "unexpected events: {triggered:?}");
+    }
+}
+
 /// The completing CommitmentSigned of #1561 signs the commitment transaction of a UDT channel
 /// as well, which carries the UDT type script and amount in its output.
 #[tokio::test]
