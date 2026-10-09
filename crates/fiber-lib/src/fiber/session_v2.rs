@@ -131,6 +131,21 @@ pub(super) fn allocate_nonce(
     record
 }
 
+#[cfg(any(test, feature = "nonce-oracle"))]
+fn oracle_label(record: &SigningNonceV2) -> String {
+    crate::fiber::nonce_oracle::v2_label(
+        record.channel_id.as_ref(),
+        &record.owner.serialize(),
+        record.number,
+        match record.purpose {
+            NoncePurposeV2::Commitment => "commitment",
+            NoncePurposeV2::Revocation => "revocation",
+            NoncePurposeV2::Closing => "closing",
+        },
+    )
+}
+
+#[cfg_attr(any(test, feature = "nonce-oracle"), track_caller)]
 pub(super) fn guarded_sign(
     record: &mut SigningNonceV2,
     key: &Privkey,
@@ -141,6 +156,15 @@ pub(super) fn guarded_sign(
 ) -> Result<PartialSignature, String> {
     bind_context(record, keys, nonce, message)?;
     if let Some(signature) = record.signature {
+        #[cfg(any(test, feature = "nonce-oracle"))]
+        crate::fiber::nonce_oracle::record_public(
+            crate::fiber::nonce_oracle::Use::Cached,
+            &record.public_nonce,
+            aggregate,
+            nonce,
+            message,
+            &oracle_label(record),
+        );
         return Ok(signature);
     }
     if record.public_nonce != secret_nonce(record, key).public_nonce() {
@@ -148,10 +172,21 @@ pub(super) fn guarded_sign(
     }
     let signature = musig2::sign_partial(aggregate, key, secret_nonce(record, key), nonce, message)
         .map_err(|error| error.to_string())?;
+    // A V2 nonce may sign exactly one context, whether the signature is sent or aggregated.
+    #[cfg(any(test, feature = "nonce-oracle"))]
+    crate::fiber::nonce_oracle::record_public(
+        crate::fiber::nonce_oracle::Use::Sent,
+        &record.public_nonce,
+        aggregate,
+        nonce,
+        message,
+        &oracle_label(record),
+    );
     record.signature = Some(signature);
     Ok(signature)
 }
 
+#[cfg_attr(any(test, feature = "nonce-oracle"), track_caller)]
 pub(super) fn bind_context(
     record: &mut SigningNonceV2,
     keys: [Pubkey; 2],
@@ -167,6 +202,8 @@ pub(super) fn bind_context(
     .concat();
     if let Some(previous) = &record.context {
         if previous != &context {
+            #[cfg(any(test, feature = "nonce-oracle"))]
+            crate::fiber::nonce_oracle::conflict(&record.public_nonce, &oracle_label(record));
             return Err("Conflicting V2 signing context for consumed nonce".to_owned());
         }
         return Ok(());

@@ -1123,6 +1123,8 @@ where
                 Ok(())
             }
             FiberChannelMessage::ReestablishChannel(ref reestablish_channel) => {
+                #[cfg(any(test, feature = "nonce-oracle"))]
+                crate::fiber::nonce_oracle::reestablish(state.get_id().as_ref(), 1);
                 let pending_commit_diff = self.store.get_pending_commit_diff(&state.get_id());
                 state
                     .handle_reestablish_channel_message(
@@ -6874,6 +6876,14 @@ impl ChannelActorState {
         let pubkey = self.get_remote_pubkey();
         let channel_outpoint = self.must_get_funding_transaction_outpoint();
 
+        #[cfg(any(test, feature = "nonce-oracle"))]
+        crate::fiber::nonce_oracle::record(
+            crate::fiber::nonce_oracle::Use::Sent,
+            &local_secnonce,
+            &key_agg_ctx,
+            &agg_nonce,
+            &message,
+        );
         let partial_signature: PartialSignature = sign_partial(
             &key_agg_ctx,
             &self.signer.funding_key,
@@ -10952,6 +10962,7 @@ static SECNONCES: LazyLock<Mutex<HashMap<[u8; 64], Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::default()));
 
 impl Musig2SignContext {
+    #[cfg_attr(any(test, feature = "nonce-oracle"), track_caller)]
     fn sign(&self, message: &[u8]) -> Result<PartialSignature, SigningError> {
         #[cfg(test)]
         {
@@ -10970,15 +10981,25 @@ impl Musig2SignContext {
             }
         }
 
-        sign_partial(
+        let signature: PartialSignature = sign_partial(
             &self.common_ctx.key_agg_ctx,
             self.seckey.clone(),
             self.secnonce.clone(),
             &self.common_ctx.agg_nonce,
             message,
-        )
+        )?;
+        #[cfg(any(test, feature = "nonce-oracle"))]
+        crate::fiber::nonce_oracle::record(
+            crate::fiber::nonce_oracle::Use::Sent,
+            &self.secnonce,
+            &self.common_ctx.key_agg_ctx,
+            &self.common_ctx.agg_nonce,
+            message,
+        );
+        Ok(signature)
     }
 
+    #[cfg_attr(any(test, feature = "nonce-oracle"), track_caller)]
     fn sign_and_aggregate(
         &self,
         message: &[u8],
@@ -10991,6 +11012,14 @@ impl Musig2SignContext {
             &self.common_ctx.agg_nonce,
             message,
         )?;
+        #[cfg(any(test, feature = "nonce-oracle"))]
+        crate::fiber::nonce_oracle::record(
+            crate::fiber::nonce_oracle::Use::Aggregated,
+            &self.secnonce,
+            &self.common_ctx.key_agg_ctx,
+            &self.common_ctx.agg_nonce,
+            message,
+        );
         Ok(self.common_ctx.aggregate_partial_signatures_for_msg(
             local_signature,
             remote_signature,

@@ -1231,6 +1231,8 @@ where
         state: &mut ChannelActorState,
         peer: ReestablishChannelV2,
     ) -> ProcessingChannelResult {
+        #[cfg(any(test, feature = "nonce-oracle"))]
+        crate::fiber::nonce_oracle::reestablish(state.get_id().as_ref(), 2);
         // A valid old image cannot reveal post-backup nonce use or revocations.
         // Matching peer counters/nonces are untrusted assertions, not freshness proof.
         state.ensure_v2_not_quarantined()?;
@@ -1447,6 +1449,8 @@ where
         } else {
             None
         };
+        #[cfg(any(test, feature = "nonce-oracle"))]
+        crate::fiber::nonce_oracle::replay(state.get_id().as_ref(), replay_cs, ack.is_some());
         state.recovery_peer_v2 = Some(peer);
         self.replay_effects_v2(state);
         self.update_tlc_status_on_ack(myself, state).await;

@@ -13,6 +13,8 @@ mod fee;
 pub(crate) mod gossip_policy;
 mod in_flight_ckb_tx_actor;
 mod key;
+#[cfg(any(test, feature = "nonce-oracle"))]
+pub(crate) mod nonce_oracle;
 pub(crate) mod onchain_tlc_reconcile;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod onion_service;
