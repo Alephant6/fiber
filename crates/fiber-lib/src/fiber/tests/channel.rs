@@ -13457,3 +13457,414 @@ fn settlement_tlc_to_witness_matches_commitment_contract_layout() {
         &tlc.payment_amount.to_le_bytes()
     );
 }
+
+/// Splitmix64, so that a seed always gives the same schedule.
+struct ScheduleRng(u64);
+
+impl ScheduleRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EpochOp {
+    /// Start a keysend payment from A (true) or from B (false).
+    Pay(bool),
+    /// The next CommitmentSigned (true) or RevokeAndAck (false) the node sends is lost: held
+    /// until the epoch ends, then dropped.
+    Lose(bool, bool),
+    Sleep(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EpochEnd {
+    Disconnect,
+    Crash(bool),
+}
+
+/// One connection epoch: some payments and message losses, ended by a disconnect or a crash
+/// of one node, after which the nodes reconnect.
+#[derive(Clone, Debug)]
+struct Epoch {
+    ops: Vec<EpochOp>,
+    end: EpochEnd,
+}
+
+fn schedule_for_seed(seed: u64) -> Vec<Epoch> {
+    let natural = std::env::var("FUZZ_MODE").as_deref() == Ok("natural");
+    let mut rng = ScheduleRng(seed);
+    let epochs = 1 + rng.below(4) as usize;
+    let mut crashes = 0;
+    (0..epochs)
+        .map(|_| {
+            let ops = (0..rng.below(7))
+                .map(|_| match rng.below(100) {
+                    0..=44 => EpochOp::Pay(rng.below(2) == 0),
+                    45..=64 => {
+                        let (at_a, commitment_signed) = (rng.below(2) == 0, rng.below(4) != 0);
+                        if natural {
+                            EpochOp::Sleep(0)
+                        } else {
+                            EpochOp::Lose(at_a, commitment_signed)
+                        }
+                    }
+                    _ => EpochOp::Sleep([0, 2, 5, 10, 20, 50, 100][rng.below(7) as usize]),
+                })
+                .collect();
+            let end = if crashes < 2 && rng.below(100) < 20 {
+                crashes += 1;
+                EpochEnd::Crash(rng.below(2) == 0)
+            } else {
+                EpochEnd::Disconnect
+            };
+            Epoch { ops, end }
+        })
+        .collect()
+}
+
+const EXPLORE_WATCHED_EVENTS: [&str; 4] = [
+    "is reused for different messages",
+    "Conflicting V2 signing context",
+    "Invalid persisted V2 nonce",
+    "panicked",
+];
+
+async fn watch_explore_events(node: &NetworkNode) {
+    node.add_unexpected_events(
+        EXPLORE_WATCHED_EVENTS
+            .iter()
+            .map(|event| event.to_string())
+            .collect(),
+    )
+    .await;
+}
+
+/// Polls both ends' connectivity until `done` holds or the timeout passes.
+async fn explore_wait_connectivity(
+    node_a: &NetworkNode,
+    node_b: &NetworkNode,
+    channel_id: Hash256,
+    timeout: Duration,
+    done: impl Fn(ChannelConnectivityState, ChannelConnectivityState) -> bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let a = node_a
+            .get_channel_actor_state(channel_id)
+            .connectivity_state;
+        let b = node_b
+            .get_channel_actor_state(channel_id)
+            .connectivity_state;
+        if done(a, b) {
+            return true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Asks A to connect to B and waits until the channel leaves Offline on either end, which
+/// is when the reestablishment starts. Errors (already connected, a duplicate connection)
+/// are fine: the point is only that the nodes end up connected. A restarted test node
+/// listens on a new port, and a dial still in flight to the peer's old address can swallow
+/// a request, so the request is repeated with the peer's current address.
+async fn explore_reconnect(node_a: &NetworkNode, node_b: &NetworkNode, channel_id: Hash256) {
+    for _ in 0..10 {
+        let _ = call!(node_a.network_actor, |reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::ConnectPeer(
+                node_b.listening_addrs[0].clone(),
+                false,
+                PeerConnectSource::Manual,
+                Some(reply),
+            ))
+        });
+        if explore_wait_connectivity(
+            node_a,
+            node_b,
+            channel_id,
+            Duration::from_millis(500),
+            |a, b| a != ChannelConnectivityState::Offline || b != ChannelConnectivityState::Offline,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+fn explore_channel_summary(s: &ChannelActorState) -> String {
+    match &s.session_v2 {
+        Some(session) => format!(
+            "v2 pending_incoming={} pending_ack={} numbers={:?} waiting_ack={} reestablishing={}",
+            session.pending_incoming.is_some(),
+            session.pending_ack.is_some(),
+            s.get_current_commitment_numbers(),
+            s.tlc_state.waiting_ack,
+            s.reestablishing,
+        ),
+        None => format!(
+            "v1 send/verify={}/{} numbers={:?} waiting_ack={} reestablishing={}",
+            s.remote_revocation_nonce_for_send.is_some(),
+            s.remote_revocation_nonce_for_verify.is_some(),
+            s.get_current_commitment_numbers(),
+            s.tlc_state.waiting_ack,
+            s.reestablishing,
+        ),
+    }
+}
+
+/// Runs the schedule for the seed in FUZZ_SEED and prints `ORACLE seed=..` and
+/// `EXPLORE seed=.. result=..`, where the result is OK, STUCK (the channel never settled, or a
+/// payment never finished) or CLOSED (a side force closed). FUZZ_CHANNEL=legacy opens a
+/// zero-feature (V1) channel instead of a V2 one. Run with `--ignored`.
+#[tokio::test]
+#[ignore = "randomised schedule explorer; run with FUZZ_SEED"]
+async fn explore_revocation_round_schedule() {
+    init_tracing();
+    let seed: u64 = std::env::var("FUZZ_SEED")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+    let schedule = schedule_for_seed(seed);
+    let legacy = std::env::var("FUZZ_CHANNEL").as_deref() == Ok("legacy");
+    let (mut node_a, mut node_b, channel_id) = if legacy {
+        create_legacy_nodes_with_established_channel(500_00_000_000, 500_00_000_000, true).await
+    } else {
+        create_nodes_with_established_channel(500_00_000_000, 500_00_000_000, true).await
+    };
+    let channel_kind = if node_a
+        .get_channel_actor_state(channel_id)
+        .session_v2
+        .is_some()
+    {
+        "v2"
+    } else {
+        "v1"
+    };
+    watch_explore_events(&node_a).await;
+    watch_explore_events(&node_b).await;
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut payments: Vec<(bool, Hash256)> = Vec::new();
+
+    for epoch in &schedule {
+        let mut lost_at = [false, false];
+        for op in &epoch.ops {
+            match *op {
+                EpochOp::Pay(from_a) => {
+                    let (from, to) = if from_a {
+                        (&node_a, &node_b)
+                    } else {
+                        (&node_b, &node_a)
+                    };
+                    if let Ok(payment) = from.send_payment_keysend(to, 10_000_000, false).await {
+                        payments.push((from_a, payment.payment_hash));
+                    }
+                }
+                EpochOp::Lose(at_a, _)
+                    if std::mem::replace(&mut lost_at[usize::from(at_a)], true) => {}
+                EpochOp::Lose(at_a, commitment_signed) => {
+                    let kind = if commitment_signed {
+                        TestFiberMessageKind::CommitmentSigned
+                    } else {
+                        TestFiberMessageKind::RevokeAndAck
+                    };
+                    let (from, to) = if at_a {
+                        (&node_a, &node_b)
+                    } else {
+                        (&node_b, &node_a)
+                    };
+                    from.hold_next_fiber_message_then_blackhole(to.pubkey, channel_id, kind)
+                        .await;
+                }
+                EpochOp::Sleep(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+            }
+        }
+        match epoch.end {
+            EpochEnd::Disconnect => {
+                node_a
+                    .network_actor
+                    .send_message(NetworkActorMessage::new_command(
+                        NetworkActorCommand::DisconnectPeer(
+                            node_b.pubkey,
+                            PeerDisconnectReason::Requested,
+                            None,
+                        ),
+                    ))
+                    .expect("node_a alive");
+                explore_wait_connectivity(
+                    &node_a,
+                    &node_b,
+                    channel_id,
+                    Duration::from_secs(5),
+                    |a, b| {
+                        a == ChannelConnectivityState::Offline
+                            && b == ChannelConnectivityState::Offline
+                    },
+                )
+                .await;
+                // Whatever was held never reached the peer.
+                node_a.discard_held_fiber_messages().await;
+                node_b.discard_held_fiber_messages().await;
+                explore_reconnect(&node_a, &node_b, channel_id).await;
+            }
+            EpochEnd::Crash(a) => {
+                let (crashed, other) = if a {
+                    (&mut node_a, &mut node_b)
+                } else {
+                    (&mut node_b, &mut node_a)
+                };
+                for event in crashed.get_triggered_unexpected_events().await {
+                    *counts.entry(event).or_default() += 1;
+                }
+                // What the crashed node still held, and its hold, die with it: nothing it
+                // sends after the cut can get through.
+                crashed.stop().await;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while other.get_channel_actor_state(channel_id).connectivity_state
+                    != ChannelConnectivityState::Offline
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other.discard_held_fiber_messages().await;
+                // Same pause as NetworkNode::restart.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                crashed.start().await;
+                watch_explore_events(crashed).await;
+                let crashed: &NetworkNode = crashed;
+                let other: &NetworkNode = other;
+                if a {
+                    explore_reconnect(crashed, other, channel_id).await;
+                } else {
+                    explore_reconnect(other, crashed, channel_id).await;
+                }
+            }
+        }
+    }
+    // Let a reconnection that is still in progress finish before judging the end state, and
+    // ask again if the nodes are still apart.
+    for _ in 0..3 {
+        if explore_wait_connectivity(
+            &node_a,
+            &node_b,
+            channel_id,
+            Duration::from_secs(4),
+            |a, b| a == ChannelConnectivityState::Online && b == ChannelConnectivityState::Online,
+        )
+        .await
+        {
+            break;
+        }
+        explore_reconnect(&node_a, &node_b, channel_id).await;
+    }
+
+    // Settle: both sides Ready and every payment final; then the channel must still carry a
+    // new payment each way. The probes judge liveness without reading protocol internals,
+    // so V2 and legacy channels are judged the same way. A failed probe is retried.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut probes: [Option<Hash256>; 2] = [None, None];
+    let mut probe_retries = 0;
+    let result = loop {
+        let a = node_a.get_channel_actor_state(channel_id);
+        let b = node_b.get_channel_actor_state(channel_id);
+        if a.state != ChannelState::ChannelReady || b.state != ChannelState::ChannelReady {
+            break "CLOSED".to_string();
+        }
+        let mut all_final = true;
+        for (from_a, hash) in &payments {
+            let node = if *from_a { &node_a } else { &node_b };
+            if !matches!(
+                node.get_payment_status(*hash).await,
+                PaymentStatus::Success | PaymentStatus::Failed
+            ) {
+                all_final = false;
+            }
+        }
+        let mut probes_ok = all_final;
+        if all_final {
+            for (index, from_a) in [true, false].into_iter().enumerate() {
+                let (from, to) = if from_a {
+                    (&node_a, &node_b)
+                } else {
+                    (&node_b, &node_a)
+                };
+                let status = match probes[index] {
+                    Some(hash) => Some(from.get_payment_status(hash).await),
+                    None => None,
+                };
+                match status {
+                    Some(PaymentStatus::Success) => {}
+                    Some(PaymentStatus::Failed) | None => {
+                        if status.is_some() {
+                            probe_retries += 1;
+                        }
+                        probes[index] = from
+                            .send_payment_keysend(to, 10_000_000, false)
+                            .await
+                            .ok()
+                            .map(|payment| payment.payment_hash);
+                        probes_ok = false;
+                    }
+                    Some(_) => probes_ok = false,
+                }
+            }
+        }
+        if probes_ok {
+            break "OK".to_string();
+        }
+        if tokio::time::Instant::now() > deadline {
+            let mut probe_status = Vec::new();
+            for (index, node) in [&node_a, &node_b].into_iter().enumerate() {
+                probe_status.push(match probes[index] {
+                    Some(hash) => format!("{:?}", node.get_payment_status(hash).await),
+                    None => "not sent".to_string(),
+                });
+            }
+            break format!(
+                "STUCK(a {}, b {}, payments final={}, probes a->b={} b->a={}, probe retries={})",
+                explore_channel_summary(&a),
+                explore_channel_summary(&b),
+                all_final,
+                probe_status[0],
+                probe_status[1],
+                probe_retries,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for node in [&node_a, &node_b] {
+        for event in node.get_triggered_unexpected_events().await {
+            *counts.entry(event).or_default() += 1;
+        }
+    }
+    let mut success = 0;
+    let mut failed = 0;
+    for (from_a, hash) in &payments {
+        let node = if *from_a { &node_a } else { &node_b };
+        match node.get_payment_status(*hash).await {
+            PaymentStatus::Success => success += 1,
+            PaymentStatus::Failed => failed += 1,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "ORACLE seed={seed} {}",
+        crate::fiber::nonce_oracle::summary()
+    );
+    eprintln!(
+        "EXPLORE seed={seed} channel={channel_kind} result={result} payments={}/{success}/{failed} probe_retries={probe_retries} events={counts:?} schedule={schedule:?}",
+        payments.len()
+    );
+    assert_eq!(result, "OK", "seed {seed}");
+}

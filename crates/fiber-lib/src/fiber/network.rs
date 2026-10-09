@@ -834,6 +834,7 @@ pub enum TestFiberMessageKind {
     Shutdown,
     /// Preserve the CS/RAA stream order when simulating a lost response.
     CommitmentOrAck,
+    Any,
 }
 
 #[cfg(test)]
@@ -843,6 +844,8 @@ pub struct TestFiberMessageHold {
     pub channel_id: Hash256,
     pub kind: TestFiberMessageKind,
     pub remaining: NonZeroUsize,
+    /// After the last matching message, hold every later message too.
+    pub blackhole_after: bool,
 }
 
 #[cfg(test)]
@@ -859,13 +862,15 @@ impl TestFiberMessageHold {
         }
         matches!(
             (&self.kind, channel_message),
-            (
-                TestFiberMessageKind::CommitmentOrAck,
-                FiberChannelMessage::CommitmentSigned(_)
-                    | FiberChannelMessage::CommitmentSignedV2(_)
-                    | FiberChannelMessage::RevokeAndAck(_)
-                    | FiberChannelMessage::RevokeAndAckV2(_)
-            ) | (TestFiberMessageKind::AddTlc, FiberChannelMessage::AddTlc(_))
+            (TestFiberMessageKind::Any, _)
+                | (
+                    TestFiberMessageKind::CommitmentOrAck,
+                    FiberChannelMessage::CommitmentSigned(_)
+                        | FiberChannelMessage::CommitmentSignedV2(_)
+                        | FiberChannelMessage::RevokeAndAck(_)
+                        | FiberChannelMessage::RevokeAndAckV2(_)
+                )
+                | (TestFiberMessageKind::AddTlc, FiberChannelMessage::AddTlc(_))
                 | (
                     TestFiberMessageKind::CommitmentSigned,
                     FiberChannelMessage::CommitmentSigned(_)
@@ -2477,6 +2482,18 @@ where
                             .as_mut()
                             .expect("matching test hold")
                             .remaining = remaining;
+                    } else if state
+                        .test_fiber_message_hold
+                        .as_ref()
+                        .is_some_and(|hold| hold.blackhole_after)
+                    {
+                        let hold = state
+                            .test_fiber_message_hold
+                            .as_mut()
+                            .expect("matching test hold");
+                        hold.kind = TestFiberMessageKind::Any;
+                        hold.blackhole_after = false;
+                        hold.remaining = NonZeroUsize::MAX;
                     } else {
                         state.test_fiber_message_hold = None;
                     }

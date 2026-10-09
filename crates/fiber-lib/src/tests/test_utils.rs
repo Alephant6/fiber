@@ -808,6 +808,33 @@ impl NetworkNode {
                         channel_id,
                         kind,
                         remaining,
+                        blackhole_after: false,
+                    },
+                    reply,
+                ))
+            })
+        })
+        .await
+        .expect("timed out setting test Fiber message hold")
+        .expect("network actor alive");
+    }
+
+    #[cfg(test)]
+    pub async fn hold_next_fiber_message_then_blackhole(
+        &self,
+        target: Pubkey,
+        channel_id: Hash256,
+        kind: TestFiberMessageKind,
+    ) {
+        tokio::time::timeout(event_wait_timeout(), async {
+            call!(self.network_actor, |reply| {
+                NetworkActorMessage::new_command(NetworkActorCommand::SetTestFiberMessageHold(
+                    TestFiberMessageHold {
+                        target,
+                        channel_id,
+                        kind,
+                        remaining: NonZeroUsize::new(1).expect("one"),
+                        blackhole_after: true,
                     },
                     reply,
                 ))
