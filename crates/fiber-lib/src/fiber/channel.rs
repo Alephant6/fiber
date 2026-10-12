@@ -556,6 +556,8 @@ where
                         // The peer's reestablish message can overtake our paced
                         // PeerReconnected event. Claim and send our side of the handshake
                         // before processing theirs so neither side is left waiting.
+                        #[cfg(any(test, feature = "nonce-oracle"))]
+                        crate::fiber::nonce_oracle::reestablish(state.get_id().as_ref(), 1);
                         state.on_peer_reconnected();
                         let pending_commit_diff =
                             self.store.get_pending_commit_diff(&state.get_id());
